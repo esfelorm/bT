@@ -1,0 +1,585 @@
+name: 🔥 HAD 2.0 - Hyper Advanced Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: '🔗 URLs (one per line, or comma/space separated)'
+        required: true
+        type: string
+      quality:
+        description: '📺 Quality preset (YouTube/Telegram only)'
+        required: true
+        type: choice
+        options:
+          - '4K (2160p)'
+          - '1080p MP4'
+          - '720p MP4 (default)'
+          - '480p MP4 (<95MB friendly)'
+          - '360p MP4'
+          - 'Audio MP3 (320kbps)'
+          - 'Audio M4A (Lossless)'
+      had_threads:
+        description: '🧵 HAD threads per file (default: CPU cores)'
+        required: false
+        type: number
+        default: 8
+      had_concurrent:
+        description: '📁 HAD concurrent downloads (default: 2)'
+        required: false
+        type: number
+        default: 2
+      had_proxy:
+        description: '🕸️ HAD proxy (socks5://host:port or http://host:port)'
+        required: false
+        type: string
+        default: ''
+      password:
+        description: '🔐 ZIP password (optional)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: '✂️ Max split size in MB (GitHub limit: 95)'
+        required: false
+        type: number
+        default: 95
+      extract_subs:
+        description: '📝 Extract subtitles? (YouTube only)'
+        required: false
+        type: boolean
+        default: false
+      create_thumbnail:
+        description: '🎬 Generate video thumbnail?'
+        required: false
+        type: boolean
+        default: false
+      auto_clean_days:
+        description: '🧹 Auto-clean files older than N days (0 = never)'
+        required: false
+        type: number
+        default: 7
+      telegram_notify:
+        description: '📨 Send Telegram notification? (needs secrets)'
+        required: false
+        type: boolean
+        default: false
+      priority_mode:
+        description: '⚡ Priority mode (for yt-dlp only)'
+        required: false
+        type: choice
+        options:
+          - 'Normal (sequential)'
+          - 'Fast (parallel up to 3 files)'
+          - 'Turbo (parallel up to 5 files)'
+      custom_headers:
+        description: '🔄 Custom HTTP headers for HAD (JSON format: {"Header":"value"})'
+        required: false
+        type: string
+        default: ''
+      custom_cookies:
+        description: '🍪 Custom cookies for HAD (Format: name1=value1; name2=value2)'
+        required: false
+        type: string
+        default: ''
+      user_agent:
+        description: '🌐 Custom User-Agent for HAD'
+        required: false
+        type: string
+        default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      max_speed:
+        description: '⚡ Max download speed in bytes/sec for HAD (0 = unlimited)'
+        required: false
+        type: number
+        default: 0
+
+jobs:
+  hyper-downloader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 💾 Cache Dependencies
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            /usr/local/bin/yt-dlp
+            /usr/local/bin/had
+            ~/.cache/yt-dlp
+          key: deps-v3-${{ runner.os }}
+
+      - name: ⚡ Install Dependencies
+        run: |
+          for i in {1..3}; do
+            sudo apt-get update -qq && break || sleep 5
+          done
+          
+          for i in {1..3}; do
+            sudo apt-get install -y --no-install-recommends \
+              aria2 ffmpeg jq curl wget unzip pigz parallel golang-go git && break || sleep 5
+          done
+          
+          if [ ! -f /usr/local/bin/yt-dlp ]; then
+            sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+            sudo chmod a+rx /usr/local/bin/yt-dlp
+          fi
+          
+          pip3 install --quiet gallery-dl
+
+      - name: 🔨 Build HAD from Source
+        run: |
+          if [ ! -f /usr/local/bin/had ]; then
+            cd /tmp
+            git clone https://github.com/Mr-Spect3r/had.git
+            cd had
+            
+            echo "📦 Initializing Go module..."
+            go mod init github.com/Mr-Spect3r/had 2>/dev/null || true
+            
+            echo "📦 Tidying dependencies..."
+            go mod tidy
+            
+            echo "🔨 Building HAD..."
+            go build -o had main.go
+            
+            sudo mv had /usr/local/bin/
+            cd /
+            rm -rf /tmp/had
+            
+            echo "✅ HAD installed successfully"
+            had -h || true
+          else
+            echo "✅ HAD already installed"
+          fi
+
+      - name: 🍪 YouTube Cookies Setup
+        env:
+          YT_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then
+            echo "$YT_COOKIES" > youtube_cookies.txt
+            echo "✅ YouTube cookies loaded"
+          else
+            touch youtube_cookies.txt
+            echo "⚠️ No YouTube cookies"
+          fi
+
+      - name: 🌐 HAD Headers & Cookies Setup
+        run: |
+          mkdir -p headers_config
+          
+          CUSTOM_HEADERS="${{ github.event.inputs.custom_headers }}"
+          if [ -n "$CUSTOM_HEADERS" ] && [ "$CUSTOM_HEADERS" != "{}" ]; then
+            echo "$CUSTOM_HEADERS" | jq -r 'to_entries[] | "-H \"\(.key): \(.value)\""' > headers_config/had_headers.txt
+            echo "✅ Custom headers for HAD loaded"
+          fi
+          
+          CUSTOM_COOKIES="${{ github.event.inputs.custom_cookies }}"
+          if [ -n "$CUSTOM_COOKIES" ]; then
+            echo "-c \"$CUSTOM_COOKIES\"" > headers_config/had_cookies.txt
+            echo "✅ Custom cookies for HAD loaded"
+          fi
+          
+          USER_AGENT="${{ github.event.inputs.user_agent }}"
+          if [ -n "$USER_AGENT" ]; then
+            echo "-H \"User-Agent: $USER_AGENT\"" >> headers_config/had_headers.txt
+          fi
+
+      - name: 🤖 Telegram Bot Setup
+        if: ${{ github.event.inputs.telegram_notify == 'true' }}
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            echo "TG_READY=true" >> $GITHUB_ENV
+          fi
+
+      - name: 🧠 Smart URL Parser & Downloader
+        shell: bash
+        run: |
+          rm -rf downloads logs
+          mkdir -p downloads logs tmp_downloads
+          
+          RAW_URLS="${{ github.event.inputs.urls }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          PRIORITY_MODE="${{ github.event.inputs.priority_mode }}"
+          HAD_THREADS="${{ github.event.inputs.had_threads }}"
+          HAD_CONCURRENT="${{ github.event.inputs.had_concurrent }}"
+          HAD_PROXY="${{ github.event.inputs.had_proxy }}"
+          MAX_SPEED="${{ github.event.inputs.max_speed }}"
+          
+          CLEAN_URLS=$(echo "$RAW_URLS" | tr ',' '\n' | tr ' ' '\n' | sed '/^$/d' | sed '/^-/d' | grep -E '^(http|https|ftp|sftp|t\.me|telegram)' || true)
+          
+          URL_COUNT=$(echo "$CLEAN_URLS" | grep -c '^' || echo "0")
+          echo "📊 Total URLs to process: $URL_COUNT"
+          
+          if [ "$URL_COUNT" -eq 0 ]; then
+            echo "❌ No valid URLs found!"
+            exit 1
+          fi
+          
+          echo "$CLEAN_URLS" > logs/urls.txt
+          
+          case "$QUALITY" in
+            *"4K"*)
+              YT_FORMAT="-f bestvideo[height<=2160]+bestaudio/best[height<=2160]"
+              ;;
+            *"1080p"*)
+              YT_FORMAT="-f bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+              ;;
+            *"720p"*)
+              YT_FORMAT="-f bestvideo[height<=720]+bestaudio/best[height<=720]"
+              ;;
+            *"480p"*)
+              YT_FORMAT="-f bestvideo[height<=480]+bestaudio/best[height<=480]"
+              ;;
+            *"360p"*)
+              YT_FORMAT="-f bestvideo[height<=360]+bestaudio/best[height<=360]"
+              ;;
+            *"Audio MP3"*)
+              YT_FORMAT="-x --audio-format mp3 --audio-quality 0"
+              ;;
+            *"Audio M4A"*)
+              YT_FORMAT="-x --audio-format m4a"
+              ;;
+            *)
+              YT_FORMAT="--merge-output-format mp4"
+              ;;
+          esac
+          
+          if [ "${{ github.event.inputs.extract_subs }}" = "true" ]; then
+            YT_FORMAT="$YT_FORMAT --write-subs --write-auto-subs --sub-langs en,fa,ar"
+          fi
+          
+          download_with_had() {
+            local URL="$1"
+            local OUTPUT_DIR="$2"
+            
+            echo "  🚀 Downloading with HAD (Hyper Advanced Downloader)"
+            echo "  📡 Multi-thread: $HAD_THREADS | Concurrent: $HAD_CONCURRENT"
+            
+            local HAD_CMD="had -t $HAD_THREADS -u $HAD_CONCURRENT -o \"$OUTPUT_DIR\""
+            
+            if [ -n "$HAD_PROXY" ] && [ "$HAD_PROXY" != "null" ]; then
+              HAD_CMD="$HAD_CMD -proxy \"$HAD_PROXY\""
+              echo "  🕸️ Using proxy: $HAD_PROXY"
+            fi
+            
+            if [ -n "$MAX_SPEED" ] && [ "$MAX_SPEED" != "0" ] && [ "$MAX_SPEED" != "null" ]; then
+              HAD_CMD="$HAD_CMD -max-speed $MAX_SPEED"
+              echo "  ⚡ Speed limit: $MAX_SPEED bytes/sec"
+            fi
+            
+            if [ -f headers_config/had_cookies.txt ]; then
+              COOKIE_VAL=$(cat headers_config/had_cookies.txt | sed 's/-c "//;s/"$//')
+              HAD_CMD="$HAD_CMD -c \"$COOKIE_VAL\""
+              echo "  🍪 Cookies: loaded"
+            fi
+            
+            if [ -f headers_config/had_headers.txt ]; then
+              while IFS= read -r header; do
+                if [ -n "$header" ]; then
+                  HAD_CMD="$HAD_CMD $header"
+                fi
+              done < headers_config/had_headers.txt
+              echo "  🌐 Headers: loaded"
+            fi
+            
+            HAD_CMD="$HAD_CMD \"$URL\""
+            
+            eval "$HAD_CMD" 2>&1
+            
+            return $?
+          }
+          
+          download_url() {
+            URL="$1"
+            
+            if [ -z "$URL" ]; then
+              return 1
+            fi
+            
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🎯 Processing: $URL"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            DATE_FOLDER=$(date +%Y-%m-%d)
+            mkdir -p "tmp_downloads/$DATE_FOLDER"
+            
+            if echo "$URL" | grep -qiE "(youtube\.com|youtu\.be)"; then
+              echo "📺 YouTube video detected"
+              COOKIE_ARG=""
+              [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
+              
+              yt-dlp $COOKIE_ARG $YT_FORMAT \
+                --progress \
+                --no-overwrites \
+                --continue \
+                --retries 10 \
+                --fragment-retries 15 \
+                --sleep-interval 3 \
+                --max-sleep-interval 8 \
+                --output "tmp_downloads/$DATE_FOLDER/%(title)s.%(ext)s" \
+                "$URL" 2>&1
+              
+            elif echo "$URL" | grep -qiE "(t\.me|telegram\.org)"; then
+              echo "📨 Telegram message detected"
+              COOKIE_ARG=""
+              [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
+              
+              if echo "$URL" | grep -q "/s/"; then
+                CHANNEL=$(echo "$URL" | sed -E 's|https?://t\.me/s/([^/]+)/.*|\1|')
+                MSG_ID=$(echo "$URL" | sed -E 's|.*/([0-9]+)$|\1|')
+                yt-dlp $COOKIE_ARG --progress --no-overwrites --continue \
+                  --output "tmp_downloads/$DATE_FOLDER/%(title)s.%(ext)s" \
+                  "https://t.me/s/$CHANNEL/$MSG_ID" 2>&1
+              else
+                yt-dlp $COOKIE_ARG --progress --no-overwrites --continue \
+                  --output "tmp_downloads/$DATE_FOLDER/%(title)s.%(ext)s" \
+                  "$URL" 2>&1
+              fi
+              
+            elif echo "$URL" | grep -qiE "(instagram\.com|pinterest\.com|tiktok\.com)"; then
+              echo "📸 Social media content detected (using gallery-dl)"
+              gallery-dl --dest "tmp_downloads/$DATE_FOLDER" "$URL" 2>&1
+              
+            else
+              echo "🌐 Generic/HTTP/HTTPS/FTP/SFTP download (using HAD)"
+              download_with_had "$URL" "tmp_downloads/$DATE_FOLDER"
+            fi
+            
+            if [ $? -eq 0 ]; then
+              echo "✅ Success: $URL"
+              echo "$URL" >> logs/success.log
+              return 0
+            else
+              echo "❌ Failed: $URL"
+              echo "$URL" >> logs/failed.log
+              return 1
+            fi
+          }
+          
+          export -f download_url
+          export YT_FORMAT
+          export HAD_THREADS HAD_CONCURRENT HAD_PROXY MAX_SPEED
+          export -f download_with_had
+          
+          if [[ "$PRIORITY_MODE" == *"Turbo"* ]]; then
+            echo "⚡ TURBO MODE: Downloading 5 files in parallel"
+            echo "$CLEAN_URLS" | parallel -j5 download_url {}
+          elif [[ "$PRIORITY_MODE" == *"Fast"* ]]; then
+            echo "🚀 FAST MODE: Downloading 3 files in parallel"
+            echo "$CLEAN_URLS" | parallel -j3 download_url {}
+          else
+            echo "🐢 NORMAL MODE: Sequential download"
+            while IFS= read -r URL; do
+              if [ -n "$URL" ]; then
+                download_url "$URL"
+              fi
+            done <<< "$CLEAN_URLS"
+          fi
+
+      - name: 🎨 Generate Thumbnails
+        if: ${{ github.event.inputs.create_thumbnail == 'true' }}
+        run: |
+          for VIDEO in tmp_downloads/*/*.{mp4,mkv,avi}; do
+            [ -f "$VIDEO" ] || continue
+            THUMB="${VIDEO%.*}.jpg"
+            ffmpeg -i "$VIDEO" -ss 00:00:05 -vframes 1 -q:v 2 "$THUMB" 2>/dev/null || true
+          done
+
+      - name: 🗜️ Smart Compression & Archiving
+        run: |
+          HAS_PASS="${{ github.event.inputs.password }}"
+          SPLIT_MB="${{ github.event.inputs.split_size }}"
+          LIMIT_BYTES=$((SPLIT_MB * 1024 * 1024))
+          
+          mkdir -p dl
+          rm -f new_files.txt
+          
+          find tmp_downloads -type f -size +1k 2>/dev/null | while read FILE; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            DATE_FOLDER=$(basename "$(dirname "$FILE")")
+            
+            SAFE_NAME=$(echo "$BASENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            DEST_DIR="dl/$DATE_FOLDER"
+            mkdir -p "$DEST_DIR"
+            
+            if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$LIMIT_BYTES" ]; then
+              echo "🔐 Archiving: $SAFE_NAME"
+              PASS_ARG=""
+              [ -n "$HAS_PASS" ] && PASS_ARG="-P $HAS_PASS"
+              
+              zip $PASS_ARG -s "${SPLIT_MB}m" \
+                "$DEST_DIR/${SAFE_NAME}.zip" -j "$FILE" 2>/dev/null
+              
+              for PART in "$DEST_DIR/${SAFE_NAME}".zip*; do
+                if [ -f "$PART" ]; then
+                  REL_PATH="${PART#dl/}"
+                  echo "$DATE_FOLDER/$REL_PATH" >> new_files.txt
+                fi
+              done
+            else
+              cp -f "$FILE" "$DEST_DIR/$SAFE_NAME"
+              echo "$DATE_FOLDER/$SAFE_NAME" >> new_files.txt
+            fi
+          done
+          
+          rm -rf tmp_downloads
+
+      - name: 🧹 Auto-Clean Old Files
+        if: ${{ github.event.inputs.auto_clean_days != '0' }}
+        run: |
+          KEEP_DAYS="${{ github.event.inputs.auto_clean_days }}"
+          find dl -type f -mtime +$KEEP_DAYS -delete 2>/dev/null || true
+          find dl -type d -empty -delete 2>/dev/null || true
+
+      - name: 📝 Generate Download Report
+        run: |
+          [ ! -f new_files.txt ] && echo "⚠️ No files downloaded" && exit 0
+          
+          REPO="${{ github.repository }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          
+          cat > report.md << 'HEADER'
+          # 📦 HAD 2.0 Download Report
+          
+          | Metric | Value |
+          |--------|-------|
+          | 📅 Date | `DATE_PLACEHOLDER` |
+          | 🎯 Quality | `QUALITY_PLACEHOLDER` |
+          | 🔐 Password | `PASS_PLACEHOLDER` |
+          | 📁 Total Files | `COUNT_PLACEHOLDER` |
+          
+          ---
+          
+          ## 📥 Download Links
+          
+          HEADER
+          
+          DATE_NOW=$(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')
+          QUALITY_NAME="${{ github.event.inputs.quality }}"
+          PASS_STATUS="${{ github.event.inputs.password }}"
+          [ -z "$PASS_STATUS" ] && PASS_STATUS="No password"
+          
+          TOTAL_FILES=$(wc -l < new_files.txt)
+          
+          sed -i "s|DATE_PLACEHOLDER|$DATE_NOW|g" report.md
+          sed -i "s|QUALITY_PLACEHOLDER|$QUALITY_NAME|g" report.md
+          sed -i "s|PASS_PLACEHOLDER|$PASS_STATUS|g" report.md
+          sed -i "s|COUNT_PLACEHOLDER|$TOTAL_FILES|g" report.md
+          
+          while IFS= read -r REL_PATH; do
+            FULL_URL="https://github.com/$REPO/raw/$BRANCH/dl/$REL_PATH"
+            FILENAME=$(basename "$REL_PATH")
+            
+            case "${FILENAME##*.}" in
+              mp4|mkv|webm) ICON="🎬" ;;
+              mp3|m4a|flac|wav) ICON="🎵" ;;
+              jpg|jpeg|png|gif|webp) ICON="🖼️" ;;
+              pdf|epub|mobi) ICON="📚" ;;
+              zip|7z|rar|z01|z02) ICON="🗜️" ;;
+              apk) ICON="📱" ;;
+              *) ICON="📄" ;;
+            esac
+            
+            echo "- $ICON [$FILENAME]($FULL_URL)" >> report.md
+          done < new_files.txt
+          
+          cat >> report.md << 'FOOTER'
+          
+          ---
+          ⚡ *Downloaded with HAD 2.0 (yt-dlp for media, HAD for everything else)*
+          FOOTER
+          
+          if [ -f Links.md ]; then
+            mv Links.md Links.md.bak
+            cat report.md > Links.md
+            echo "" >> Links.md
+            tail -n +4 Links.md.bak >> Links.md
+          else
+            mv report.md Links.md
+          fi
+
+      - name: 📨 Send Telegram Notification
+        if: ${{ github.event.inputs.telegram_notify == 'true' && env.TG_READY == 'true' }}
+        env:
+          TG_BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          DOWNLOAD_COUNT=$(wc -l < new_files.txt 2>/dev/null || echo "0")
+          FAIL_COUNT=$(wc -l < logs/failed.log 2>/dev/null || echo "0")
+          
+          MESSAGE="✅ *HAD 2.0 Download Complete*
+          ━━━━━━━━━━━━━━━━━━━━━━
+          📥 Success: *$DOWNLOAD_COUNT* file(s)
+          ❌ Failed: *$FAIL_COUNT*
+          🔗 Repository: ${{ github.repository }}
+          "
+          
+          if [ "$FAIL_COUNT" -gt 0 ] && [ -f logs/failed.log ]; then
+            MESSAGE="$MESSAGE
+          ⚠️ Failed URLs:
+          $(head -3 logs/failed.log)
+          "
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+            -d chat_id="$TG_CHAT" \
+            -d text="$MESSAGE" \
+            -d parse_mode="Markdown" \
+            -d disable_web_page_preview="true" || true
+
+      - name: 🚀 Push to Repository
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "HAD-Bot"
+          git config user.email "had-bot@users.noreply.github.com"
+          
+          git add dl/ Links.md logs/ 2>/dev/null || true
+          
+          if git diff --cached --quiet; then
+            echo "ℹ️ No changes to commit"
+          else
+            FILE_COUNT=$(find dl -type f 2>/dev/null | wc -l)
+            git commit -m "✨ HAD 2.0: Synced $FILE_COUNT files [skip ci]" || true
+            git push origin HEAD:$BRANCH || true
+          fi
+
+      - name: 📊 Final Summary
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎯 HAD 2.0 EXECUTION COMPLETED"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          if [ -f logs/success.log ]; then
+            SUCCESS=$(wc -l < logs/success.log)
+            echo "✅ Successful downloads: $SUCCESS"
+          fi
+          
+          if [ -f logs/failed.log ]; then
+            FAILED=$(wc -l < logs/failed.log)
+            echo "❌ Failed downloads: $FAILED"
+            if [ "$FAILED" -gt 0 ]; then
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "⚠️ Failed URLs:"
+              cat logs/failed.log
+            fi
+          fi
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📁 Files available at: dl/ folder"
+          echo "📋 Link list: Links.md"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
