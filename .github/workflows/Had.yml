@@ -46,7 +46,7 @@ on:
         type: boolean
         default: true
       split_size:
-        description: 'Split size in MB (0 = no split)'
+        description: 'Split size in MB (0 = no split, only used when NOT uploading)'
         required: false
         type: number
         default: 95
@@ -338,30 +338,13 @@ jobs:
           import sys
           import base64
           import lzma
-          import json
-          import time
-          
-          try:
-              from rubpy import Client
-          except ImportError:
-              import subprocess
-              subprocess.check_call([sys.executable, "-m", "pip", "install", "rubpy"])
-              from rubpy import Client
+          from rubpy import Client as RubikaClient
           
           def decode_auth_string(auth_string):
               try:
-                  auth_string = auth_string.strip()
-                  missing_padding = len(auth_string) % 4
-                  if missing_padding:
-                      auth_string += '=' * (4 - missing_padding)
-                  
                   compressed = base64.b64decode(auth_string)
                   decompressed = lzma.decompress(compressed)
-                  
-                  try:
-                      return json.loads(decompressed.decode('utf-8'))
-                  except:
-                      return eval(decompressed.decode('utf-8'))
+                  return decompressed
               except Exception as e:
                   print(f"Failed to decode auth string: {e}")
                   return None
@@ -371,70 +354,32 @@ jobs:
                   print(f"ERROR:File not found: {file_path}")
                   return None
               
+              rubpy_data = decode_auth_string(auth_string)
+              if not rubpy_data:
+                  print("ERROR:Failed to decode Rubika auth string")
+                  return None
+              
+              with open("rubpy.rp", "wb") as f:
+                  f.write(rubpy_data)
+              
               print(f"Uploading to Rubika: {os.path.basename(file_path)}")
               
               try:
-                  auth_data = decode_auth_string(auth_string)
-                  
-                  if auth_data and isinstance(auth_data, dict):
-                      client = Client(auth=auth_data)
-                  else:
-                      client = Client()
-                      
-                      if auth_string and len(auth_string) > 100:
-                          with open("temp_auth.rp", "w") as f:
-                              f.write(auth_string)
-                      
+                  client = RubikaClient(name="rubpy")
                   client.start()
                   
-                  result = client.send_file("me", file_path, caption=caption)
+                  result = client.send_document("me", file_path, caption=caption)
                   
                   client.disconnect()
                   
-                  print(f"SUCCESS:Uploaded to Rubika: {result}")
+                  print(f"SUCCESS:Uploaded to Rubika")
                   return result
               except Exception as e:
                   print(f"ERROR:Rubika upload failed: {e}")
-                  print(f"Trying alternative method...")
-                  
-                  try:
-                      import subprocess
-                      
-                      auth_data = decode_auth_string(auth_string)
-                      if auth_data and isinstance(auth_data, dict):
-                          with open("ruby_auth.json", "w") as f:
-                              json.dump(auth_data, f)
-                          print("Saved auth to ruby_auth.json")
-                      
-                      result = subprocess.run([
-                          sys.executable, "-c", f"""
-from rubpy import Client
-import json
-try:
-    with open('ruby_auth.json', 'r') as f:
-        auth = json.load(f)
-    client = Client(auth=auth)
-except:
-    client = Client()
-client.start()
-client.send_file('me', '{file_path}', caption='{caption}')
-client.disconnect()
-print('SUCCESS')
-"""
-                      ], capture_output=True, text=True)
-                      
-                      if result.returncode == 0:
-                          print("Alternative method succeeded")
-                          return True
-                      else:
-                          print(f"Alternative failed: {result.stderr}")
-                          return None
-                  except Exception as e2:
-                      print(f"Alternative method also failed: {e2}")
-                      return None
+                  return None
           
           if __name__ == "__main__":
-              if len(sys.argv) >= 3:
+              if len(sys.argv) >= 4:
                   file_path = sys.argv[1]
                   auth_string = sys.argv[2]
                   caption = sys.argv[3] if len(sys.argv) > 3 else "Downloaded With HAD! Project: https://github.com/Mr-Spect3r/had"
@@ -442,14 +387,11 @@ print('SUCCESS')
                   result = upload_to_rubika(file_path, auth_string, caption)
                   
                   if result:
-                      print("Upload successful")
                       sys.exit(0)
                   else:
-                      print("Upload failed")
                       sys.exit(1)
               else:
                   print("ERROR: Missing arguments")
-                  print("Usage: python rubika_uploader.py <file_path> <auth_string> [caption]")
                   sys.exit(1)
           EOF
 
@@ -637,264 +579,246 @@ print('SUCCESS')
           echo "Files in tmp_downloads:"
           ls -la tmp_downloads/
 
-      - name: Zip and Split Manager
+      - name: Process Files (Compress or Direct Upload)
         shell: bash
         run: |
+          UPLOAD_TO_UPLOADKON="${{ github.event.inputs.upload_to_uploadkon }}"
+          UPLOAD_TO_RUBIKA="${{ github.event.inputs.upload_to_rubika }}"
           HAS_PASS="${{ github.event.inputs.password }}"
           SPLIT_SIZE="${{ github.event.inputs.split_size }}"
-          UPLOAD_TO_UPLOADKON="${{ github.event.inputs.upload_to_uploadkon }}"
-          UPLOAD_TO_RUBIKA="${{ github.event.inputs.upload_to_rubika }}"
-          
-          UPLOAD_ENABLED="false"
-          if [ "$UPLOAD_TO_UPLOADKON" = "true" ] || [ "$UPLOAD_TO_RUBIKA" = "true" ]; then
-            UPLOAD_ENABLED="true"
-          fi
-          
-          if [ -z "$SPLIT_SIZE" ] || [ "$SPLIT_SIZE" -eq 0 ]; then
-            if [ "$UPLOAD_ENABLED" = "false" ]; then
-              SPLIT_SIZE=95
-            fi
-            LIMIT=$((SPLIT_SIZE * 1024 * 1024))
-            SPLIT_ARG="-s ${SPLIT_SIZE}m"
-          else
-            LIMIT=$((SPLIT_SIZE * 1024 * 1024))
-            SPLIT_ARG="-s ${SPLIT_SIZE}m"
-          fi
-          
-          rm -f files_to_process.txt
-          
-          if [ ! -d "tmp_downloads" ]; then
-            echo "tmp_downloads directory not found"
-            exit 0
-          fi
-          
-          for FILE in tmp_downloads/*; do
-            if [ ! -f "$FILE" ]; then
-              continue
-            fi
-            SIZE=$(stat -c%s "$FILE")
-            BASENAME=$(basename "$FILE")
-            SAFE_NAME=$(echo "$BASENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
-            
-            rm -f "dl/${SAFE_NAME}".* 2>/dev/null
-            
-            NEED_COMPRESS=false
-            if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$LIMIT" ]; then
-              NEED_COMPRESS=true
-            fi
-            
-            if [ "$NEED_COMPRESS" = "true" ]; then
-              PASS_ARG=""
-              if [ -n "$HAS_PASS" ]; then
-                PASS_ARG="-P $HAS_PASS"
-              fi
-              
-              if [ "$UPLOAD_ENABLED" = "true" ]; then
-                zip $PASS_ARG "dl/${SAFE_NAME}.zip" -j "$FILE" > /dev/null 2>&1
-                if [ -f "dl/${SAFE_NAME}.zip" ]; then
-                  echo "${SAFE_NAME}.zip" >> files_to_process.txt
-                fi
-              else
-                zip $PASS_ARG $SPLIT_ARG "dl/${SAFE_NAME}.zip" -j "$FILE" > /dev/null 2>&1
-                for ZPART in "dl/${SAFE_NAME}.zip" "dl/${SAFE_NAME}".z[0-9]*; do
-                  if [ -f "$ZPART" ]; then
-                    basename "$ZPART" >> files_to_process.txt
-                  fi
-                done
-              fi
-            else
-              cp -f "$FILE" "dl/$SAFE_NAME"
-              echo "$SAFE_NAME" >> files_to_process.txt
-            fi
-          done
-          
-          rm -rf tmp_downloads
-
-      - name: Upload Files
-        shell: bash
-        run: |
-          UPLOAD_TO_UPLOADKON="${{ github.event.inputs.upload_to_uploadkon }}"
-          UPLOAD_TO_RUBIKA="${{ github.event.inputs.upload_to_rubika }}"
           RUBIKA_AUTH_STRING="${{ github.event.inputs.rubika_auth_string }}"
           
-          if [ ! -s files_to_process.txt ]; then
-            echo "No files to process"
-            exit 0
-          fi
-          
-          if [ "$UPLOAD_TO_RUBIKA" = "true" ]; then
-            if [ -z "$RUBIKA_AUTH_STRING" ] || [ "$RUBIKA_AUTH_STRING" = "" ]; then
-              echo "ERROR: Rubika auth string is required when upload_to_rubika is true"
-              exit 1
-            fi
+          # Check if ANY upload method is selected
+          if [ "$UPLOAD_TO_UPLOADKON" = "true" ] || [ "$UPLOAD_TO_RUBIKA" = "true" ]; then
+            echo "========================================="
+            echo "Upload mode detected - Direct upload without compression"
+            echo "========================================="
             
-            echo "Uploading files to Rubika..."
-            rm -f rubika_uploaded.txt
-            touch rubika_uploaded.txt
+            # Direct upload mode - NO compression, NO splitting, NO pushing to GitHub
             
-            while IFS= read -r FILENAME; do
-              if [ -z "$FILENAME" ]; then
-                continue
+            if [ "$UPLOAD_TO_RUBIKA" = "true" ]; then
+              if [ -z "$RUBIKA_AUTH_STRING" ] || [ "$RUBIKA_AUTH_STRING" = "" ]; then
+                echo "ERROR: Rubika auth string is required when upload_to_rubika is true"
+                exit 1
               fi
               
-              FILEPATH="dl/$FILENAME"
-              if [ -f "$FILEPATH" ]; then
+              echo "Uploading files directly to Rubika..."
+              rm -f rubika_uploaded.txt
+              touch rubika_uploaded.txt
+              
+              for FILE in tmp_downloads/*; do
+                if [ ! -f "$FILE" ]; then
+                  continue
+                fi
+                
+                FILENAME=$(basename "$FILE")
                 echo "Uploading to Rubika: $FILENAME"
                 CAPTION="Downloaded File: $FILENAME\nProject: https://github.com/Mr-Spect3r/had"
-                python3 rubika_uploader.py "$FILEPATH" "$RUBIKA_AUTH_STRING" "$CAPTION"
+                python3 rubika_uploader.py "$FILE" "$RUBIKA_AUTH_STRING" "$CAPTION"
                 if [ $? -eq 0 ]; then
                   echo "${FILENAME}|UPLOADED_TO_RUBIKA" >> rubika_uploaded.txt
-                  rm -f "$FILEPATH"
+                  rm -f "$FILE"
                 else
                   echo "${FILENAME}|RUBIKA_UPLOAD_FAILED" >> rubika_uploaded.txt
                 fi
-              fi
-            done < files_to_process.txt
-            
-            rm -f files_to_process.txt
-            if [ -f rubika_uploaded.txt ]; then
-              mv rubika_uploaded.txt files_to_process.txt
-            fi
-          elif [ "$UPLOAD_TO_UPLOADKON" = "true" ]; then
-            echo "Uploading files to uploadkon.ir..."
-            rm -f uploaded_files.txt
-            touch uploaded_files.txt
-            
-            while IFS= read -r FILENAME; do
-              if [ -z "$FILENAME" ]; then
-                continue
-              fi
+              done
               
-              FILEPATH="dl/$FILENAME"
-              if [ -f "$FILEPATH" ]; then
+              # Generate simple report
+              echo "# Upload Report" > Links.md
+              echo "" >> Links.md
+              echo "**Upload Time:** $(TZ='Asia/Tehran' date +'%Y-%m-%d %H:%M:%S') (IRST)" >> Links.md
+              echo "" >> Links.md
+              echo "## Rubika Upload Results" >> Links.md
+              echo "" >> Links.md
+              
+              while IFS= read -r LINE; do
+                if [ -z "$LINE" ]; then
+                  continue
+                fi
+                FILENAME=$(echo "$LINE" | cut -d'|' -f1)
+                STATUS=$(echo "$LINE" | cut -d'|' -f2)
+                
+                if [ "$STATUS" = "UPLOADED_TO_RUBIKA" ]; then
+                  echo "- ✅ **$FILENAME** - Uploaded to Rubika (Saved in Saved Messages)" >> Links.md
+                else
+                  echo "- ❌ **$FILENAME** - Upload failed" >> Links.md
+                fi
+              done < rubika_uploaded.txt
+              
+              rm -f rubika_uploaded.txt
+              
+            elif [ "$UPLOAD_TO_UPLOADKON" = "true" ]; then
+              echo "Uploading files directly to uploadkon.ir..."
+              rm -f uploaded_files.txt
+              touch uploaded_files.txt
+              
+              for FILE in tmp_downloads/*; do
+                if [ ! -f "$FILE" ]; then
+                  continue
+                fi
+                
+                FILENAME=$(basename "$FILE")
                 echo "Uploading: $FILENAME"
-                RESULT=$(python3 uploadkon.py "$FILEPATH")
+                RESULT=$(python3 uploadkon.py "$FILE")
                 DOWNLOAD_LINK=$(echo "$RESULT" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('download_link', ''))")
                 DELETE_LINK=$(echo "$RESULT" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('delete_link', ''))")
                 
                 if [ -n "$DOWNLOAD_LINK" ] && [ "$DOWNLOAD_LINK" != "None" ]; then
                   echo "${FILENAME}|${DOWNLOAD_LINK}|${DELETE_LINK}" >> uploaded_files.txt
-                  rm -f "$FILEPATH"
+                  rm -f "$FILE"
                 else
                   echo "${FILENAME}|ERROR|" >> uploaded_files.txt
                 fi
-              fi
-            done < files_to_process.txt
+              done
+              
+              # Generate links report
+              echo "# Download Links" > Links.md
+              echo "" >> Links.md
+              echo "**Upload Time:** $(TZ='Asia/Tehran' date +'%Y-%m-%d %H:%M:%S') (IRST)" >> Links.md
+              echo "" >> Links.md
+              echo "---" >> Links.md
+              echo "" >> Links.md
+              echo "## File Links" >> Links.md
+              echo "" >> Links.md
+              
+              while IFS= read -r LINE; do
+                if [ -z "$LINE" ]; then
+                  continue
+                fi
+                FILENAME=$(echo "$LINE" | cut -d'|' -f1)
+                DOWNLOAD_LINK=$(echo "$LINE" | cut -d'|' -f2)
+                DELETE_LINK=$(echo "$LINE" | cut -d'|' -f3)
+                
+                if [ "$DOWNLOAD_LINK" != "ERROR" ] && [ "$DOWNLOAD_LINK" != "" ]; then
+                  DISPLAY_NAME=$(echo "$FILENAME" | sed 's/[_\-\.]/ /g')
+                  echo "- **$DISPLAY_NAME** - [Download]($DOWNLOAD_LINK) | [Delete]($DELETE_LINK)" >> Links.md
+                fi
+              done < uploaded_files.txt
+              
+              rm -f uploaded_files.txt
+            fi
+            
+            # Clean up temp directory
+            rm -rf tmp_downloads
+            
+          else
+            echo "========================================="
+            echo "GitHub storage mode - Compress, split and push to GitHub"
+            echo "========================================="
+            
+            # GitHub storage mode - Compress and split files
+            
+            if [ -z "$SPLIT_SIZE" ] || [ "$SPLIT_SIZE" -eq 0 ]; then
+              LIMIT=999999999
+              SPLIT_ARG=""
+            else
+              LIMIT=$((SPLIT_SIZE * 1024 * 1024))
+              SPLIT_ARG="-s ${SPLIT_SIZE}m"
+            fi
             
             rm -f files_to_process.txt
-            if [ -f uploaded_files.txt ]; then
-              mv uploaded_files.txt files_to_process.txt
-            fi
-          else
-            mv files_to_process.txt new_files.txt
-          fi
-
-      - name: Generate Links.md
-        shell: bash
-        run: |
-          if [ ! -s files_to_process.txt ] && [ ! -s new_files.txt ]; then
-            echo "No files to generate links"
-            exit 0
-          fi
-          
-          UPLOAD_TO_UPLOADKON="${{ github.event.inputs.upload_to_uploadkon }}"
-          UPLOAD_TO_RUBIKA="${{ github.event.inputs.upload_to_rubika }}"
-          REPO="${{ github.repository }}"
-          BRANCH="${GITHUB_REF_NAME}"
-          RUN_ID="${{ github.run_id }}"
-          
-          if [ -f files_to_process.txt ]; then
-            TOTAL_FILES=$(cat files_to_process.txt | wc -l)
-            SOURCE_FILE="files_to_process.txt"
-          else
-            TOTAL_FILES=$(cat new_files.txt | wc -l)
-            SOURCE_FILE="new_files.txt"
-          fi
-          
-          CURRENT_DATE=$(TZ='Asia/Tehran' date +'%Y-%m-%d %H:%M:%S')
-          
-          echo "# Download Links" > Links.md
-          echo "" >> Links.md
-          echo "**Last Updated:** $CURRENT_DATE (IRST)" >> Links.md
-          echo "" >> Links.md
-          echo "---" >> Links.md
-          echo "" >> Links.md
-          echo "## Statistics" >> Links.md
-          echo "" >> Links.md
-          echo "| Metric | Value |" >> Links.md
-          echo "|--------|-------|" >> Links.md
-          echo "| Total Files | $TOTAL_FILES |" >> Links.md
-          echo "| Repository | $REPO |" >> Links.md
-          echo "| Branch | $BRANCH |" >> Links.md
-          echo "| Run ID | $RUN_ID |" >> Links.md
-          echo "" >> Links.md
-          echo "---" >> Links.md
-          echo "" >> Links.md
-          echo "## Download List" >> Links.md
-          echo "" >> Links.md
-          
-          while IFS= read -r LINE; do
-            if [ -z "$LINE" ]; then
-              continue
+            
+            if [ ! -d "tmp_downloads" ]; then
+              echo "tmp_downloads directory not found"
+              exit 0
             fi
             
-            if [ "$UPLOAD_TO_RUBIKA" = "true" ]; then
-              FILENAME=$(echo "$LINE" | cut -d'|' -f1)
-              STATUS=$(echo "$LINE" | cut -d'|' -f2)
-              
-              DISPLAY_NAME=$(echo "$FILENAME" | sed 's/\.zip$//; s/\.z[0-9]\+$//; s/[_\-\.]/ /g')
-              
-              if [ "$STATUS" = "UPLOADED_TO_RUBIKA" ]; then
-                echo "- **$DISPLAY_NAME** - ✅ Uploaded to Rubika (Saved in Rubika Saved Messages)" >> Links.md
-              else
-                echo "- **$DISPLAY_NAME** - ❌ Rubika upload failed" >> Links.md
-              fi
-              echo "" >> Links.md
-            elif [ "$UPLOAD_TO_UPLOADKON" = "true" ]; then
-              FILENAME=$(echo "$LINE" | cut -d'|' -f1)
-              DOWNLOAD_LINK=$(echo "$LINE" | cut -d'|' -f2)
-              DELETE_LINK=$(echo "$LINE" | cut -d'|' -f3)
-              
-              if [ "$DOWNLOAD_LINK" = "ERROR" ]; then
+            for FILE in tmp_downloads/*; do
+              if [ ! -f "$FILE" ]; then
                 continue
               fi
+              SIZE=$(stat -c%s "$FILE")
+              BASENAME=$(basename "$FILE")
+              SAFE_NAME=$(echo "$BASENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
               
-              DISPLAY_NAME=$(echo "$FILENAME" | sed 's/\.zip$//; s/\.z[0-9]\+$//; s/[_\-\.]/ /g')
-              echo "- **$DISPLAY_NAME** - [Download]($DOWNLOAD_LINK) - [Delete]($DELETE_LINK)" >> Links.md
-              echo "" >> Links.md
-            else
-              FILENAME="$LINE"
-              DOWNLOAD_LINK="https://github.com/$REPO/raw/$BRANCH/dl/$FILENAME"
-              DISPLAY_NAME=$(echo "$FILENAME" | sed 's/\.zip$//; s/\.z[0-9]\+$//; s/[_\-\.]/ /g')
+              rm -f "dl/${SAFE_NAME}".* 2>/dev/null
               
-              if [ -f "dl/$FILENAME" ]; then
-                SIZE_BYTES=$(stat -c%s "dl/$FILENAME" 2>/dev/null || echo 0)
-                if [ $SIZE_BYTES -ge 1073741824 ]; then
-                  SIZE_VALUE=$(echo "scale=2; $SIZE_BYTES/1073741824" | bc)
-                  SIZE_STR="${SIZE_VALUE} GB"
-                elif [ $SIZE_BYTES -ge 1048576 ]; then
-                  SIZE_VALUE=$(echo "scale=1; $SIZE_BYTES/1048576" | bc)
-                  SIZE_STR="${SIZE_VALUE} MB"
-                else
-                  if [ $SIZE_BYTES -gt 0 ]; then
-                    SIZE_VALUE=$((SIZE_BYTES/1024))
-                    SIZE_STR="${SIZE_VALUE} KB"
-                  else
-                    SIZE_STR="Unknown"
-                  fi
+              if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$LIMIT" ]; then
+                PASS_ARG=""
+                if [ -n "$HAS_PASS" ]; then
+                  PASS_ARG="-P $HAS_PASS"
                 fi
+                zip $PASS_ARG $SPLIT_ARG "dl/${SAFE_NAME}.zip" -j "$FILE" > /dev/null 2>&1
+                
+                for ZPART in "dl/${SAFE_NAME}.zip" "dl/${SAFE_NAME}".z[0-9]*; do
+                  if [ -f "$ZPART" ]; then
+                    basename "$ZPART" >> files_to_process.txt
+                  fi
+                done
               else
-                SIZE_STR="Unknown"
+                cp -f "$FILE" "dl/$SAFE_NAME"
+                echo "$SAFE_NAME" >> files_to_process.txt
               fi
+            done
+            
+            rm -rf tmp_downloads
+            
+            # Generate links for GitHub files
+            if [ -s files_to_process.txt ]; then
+              REPO="${{ github.repository }}"
+              BRANCH="${GITHUB_REF_NAME}"
+              RUN_ID="${{ github.run_id }}"
+              TOTAL_FILES=$(cat files_to_process.txt | wc -l)
+              CURRENT_DATE=$(TZ='Asia/Tehran' date +'%Y-%m-%d %H:%M:%S')
               
-              echo "- **$DISPLAY_NAME** - [Download]($DOWNLOAD_LINK) - Size: $SIZE_STR" >> Links.md
+              echo "# Download Links" > Links.md
               echo "" >> Links.md
+              echo "**Last Updated:** $CURRENT_DATE (IRST)" >> Links.md
+              echo "" >> Links.md
+              echo "---" >> Links.md
+              echo "" >> Links.md
+              echo "## Statistics" >> Links.md
+              echo "" >> Links.md
+              echo "| Metric | Value |" >> Links.md
+              echo "|--------|-------|" >> Links.md
+              echo "| Total Files | $TOTAL_FILES |" >> Links.md
+              echo "| Repository | $REPO |" >> Links.md
+              echo "| Branch | $BRANCH |" >> Links.md
+              echo "| Run ID | $RUN_ID |" >> Links.md
+              echo "" >> Links.md
+              echo "---" >> Links.md
+              echo "" >> Links.md
+              echo "## Download List" >> Links.md
+              echo "" >> Links.md
+              
+              while IFS= read -r FILENAME; do
+                if [ -z "$FILENAME" ]; then
+                  continue
+                fi
+                
+                DOWNLOAD_LINK="https://github.com/$REPO/raw/$BRANCH/dl/$FILENAME"
+                DISPLAY_NAME=$(echo "$FILENAME" | sed 's/\.zip$//; s/\.z[0-9]\+$//; s/[_\-\.]/ /g')
+                
+                if [ -f "dl/$FILENAME" ]; then
+                  SIZE_BYTES=$(stat -c%s "dl/$FILENAME" 2>/dev/null || echo 0)
+                  if [ $SIZE_BYTES -ge 1073741824 ]; then
+                    SIZE_VALUE=$(echo "scale=2; $SIZE_BYTES/1073741824" | bc)
+                    SIZE_STR="${SIZE_VALUE} GB"
+                  elif [ $SIZE_BYTES -ge 1048576 ]; then
+                    SIZE_VALUE=$(echo "scale=1; $SIZE_BYTES/1048576" | bc)
+                    SIZE_STR="${SIZE_VALUE} MB"
+                  else
+                    if [ $SIZE_BYTES -gt 0 ]; then
+                      SIZE_VALUE=$((SIZE_BYTES/1024))
+                      SIZE_STR="${SIZE_VALUE} KB"
+                    else
+                      SIZE_STR="Unknown"
+                    fi
+                  fi
+                else
+                  SIZE_STR="Unknown"
+                fi
+                
+                echo "- **$DISPLAY_NAME** - [Download]($DOWNLOAD_LINK) - Size: $SIZE_STR" >> Links.md
+                echo "" >> Links.md
+              done < files_to_process.txt
+              
+              rm -f files_to_process.txt
             fi
-          done < "$SOURCE_FILE"
-          
-          rm -f files_to_process.txt new_files.txt
+          fi
 
-      - name: Push to Repository
+      - name: Push to Repository (Only when NOT uploading)
+        if: github.event.inputs.upload_to_uploadkon == 'false' && github.event.inputs.upload_to_rubika == 'false'
         run: |
           BRANCH="${GITHUB_REF_NAME}"
           git config user.name "Downloader Bot"
