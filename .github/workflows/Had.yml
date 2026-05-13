@@ -338,10 +338,16 @@ jobs:
           import sys
           import base64
           import lzma
+          import json
           from rubpy import Client as RubikaClient
           
           def decode_auth_string(auth_string):
               try:
+                  auth_string = auth_string.strip()
+                  missing_padding = len(auth_string) % 4
+                  if missing_padding:
+                      auth_string += '=' * (4 - missing_padding)
+                  
                   compressed = base64.b64decode(auth_string)
                   decompressed = lzma.decompress(compressed)
                   return decompressed
@@ -356,8 +362,17 @@ jobs:
               
               rubpy_data = decode_auth_string(auth_string)
               if not rubpy_data:
-                  print("ERROR:Failed to decode Rubika auth string")
-                  return None
+                  print("Trying direct auth string...")
+                  try:
+                      client = RubikaClient(auth=auth_string)
+                      client.start()
+                      result = client.send_document("me", file_path, caption=caption)
+                      client.disconnect()
+                      print(f"SUCCESS:Uploaded to Rubika")
+                      return result
+                  except Exception as e2:
+                      print(f"ERROR:Direct auth also failed: {e2}")
+                      return None
               
               with open("rubpy.rp", "wb") as f:
                   f.write(rubpy_data)
