@@ -46,15 +46,10 @@ on:
         type: boolean
         default: true
       split_size:
-        description: 'Split size in MB (0 = no split, >0 = split into parts)'
+        description: 'Split size in MB (0 = no split)'
         required: false
         type: number
         default: 95
-      user_max_size:
-        description: 'User defined max size per part in MB (if higher than file size, single part will be created)'
-        required: false
-        type: number
-        default: 0
       upload_to_uploadkon:
         description: 'Upload files to uploadkon.ir instead of GitHub'
         required: false
@@ -416,7 +411,7 @@ jobs:
               headers = {
                   "X-Requested-With": "XMLHttpRequest",
                   "Origin": "https://uploadkon.ir",
-                  "Referer": "https://uploadkon.ir/",
+                  "Referer": "https://uploadkon.ir",
               }
               with open(filepath, "rb") as f:
                   files = {
@@ -538,7 +533,7 @@ jobs:
                 if [[ "$QUALITY" == *"1080p"* ]]; then
                   YT_F="-f bestvideo[height<=1080]+bestaudio/best[height<=1080]"
                 elif [[ "$QUALITY" == *"720p"* ]]; then
-                  YT_F="-f bestvideo[height<=720]+bestaudio/best[720]"
+                  YT_F="-f bestvideo[height<=720]+bestaudio/best[height<=720]"
                 elif [[ "$QUALITY" == *"480p"* ]]; then
                   YT_F="-f bestvideo[height<=480]+bestaudio/best[height<=480]"
                 elif [[ "$QUALITY" == *"360p"* ]]; then
@@ -584,122 +579,102 @@ jobs:
           echo "Files in tmp_downloads:"
           ls -la tmp_downloads/
 
-      - name: Zip and Split Manager
-        id: zip_manager
+      - name: Zip and Split Manager (Skip if Upload is Enabled)
         shell: bash
         run: |
-          HAS_PASS="${{ github.event.inputs.password }}"
-          SPLIT_SIZE="${{ github.event.inputs.split_size }}"
-          USER_MAX_SIZE="${{ github.event.inputs.user_max_size }}"
           UPLOAD_TO_UPLOADKON="${{ github.event.inputs.upload_to_uploadkon }}"
           UPLOAD_TO_RUBIKA="${{ github.event.inputs.upload_to_rubika }}"
           
-          UPLOAD_ENABLED="false"
-          SKIP_GITHUB_PUSH="false"
-          
+          # اگر هرکدام از آپلودها فعال باشد، مرحله فشرده‌سازی را رد کن
           if [ "$UPLOAD_TO_UPLOADKON" = "true" ] || [ "$UPLOAD_TO_RUBIKA" = "true" ]; then
-            UPLOAD_ENABLED="true"
-            SKIP_GITHUB_PUSH="true"
-            echo "Upload to external service enabled - files will NOT be pushed to GitHub repository"
-          fi
-          
-          # Save SKIP_GITHUB_PUSH as output and as file for later steps
-          echo "skip_github_push=$SKIP_GITHUB_PUSH" >> $GITHUB_OUTPUT
-          echo "$SKIP_GITHUB_PUSH" > skip_push_flag.txt
-          
-          # Determine actual split size based on user input and file sizes
-          if [ -z "$SPLIT_SIZE" ] || [ "$SPLIT_SIZE" -eq 0 ]; then
-            if [ "$UPLOAD_ENABLED" = "false" ]; then
-              SPLIT_SIZE=95
+            echo "Upload option is enabled. Skipping zip/split process. Files will be uploaded directly."
+            
+            # فقط فایل‌ها را به پوشه dl منتقل کن بدون فشرده‌سازی
+            rm -f files_to_process.txt
+            
+            if [ ! -d "tmp_downloads" ]; then
+              echo "tmp_downloads directory not found"
+              exit 0
             fi
-            ACTUAL_SPLIT_SIZE=$SPLIT_SIZE
+            
+            for FILE in tmp_downloads/*; do
+              if [ ! -f "$FILE" ]; then
+                continue
+              fi
+              BASENAME=$(basename "$FILE")
+              SAFE_NAME=$(echo "$BASENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+              cp -f "$FILE" "dl/$SAFE_NAME"
+              echo "$SAFE_NAME" >> files_to_process.txt
+            done
+            
+            rm -rf tmp_downloads
           else
-            ACTUAL_SPLIT_SIZE=$SPLIT_SIZE
-          fi
-          
-          rm -f files_to_process.txt
-          
-          if [ ! -d "tmp_downloads" ]; then
-            echo "tmp_downloads directory not found"
-            exit 0
-          fi
-          
-          for FILE in tmp_downloads/*; do
-            if [ ! -f "$FILE" ]; then
-              continue
-            fi
-            SIZE=$(stat -c%s "$FILE")
-            BASENAME=$(basename "$FILE")
-            SAFE_NAME=$(echo "$BASENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            # اگر آپلود فعال نیست، فرآیند فشرده‌سازی و اسپلیت انجام شود
+            HAS_PASS="${{ github.event.inputs.password }}"
+            SPLIT_SIZE="${{ github.event.inputs.split_size }}"
             
-            rm -f "dl/${SAFE_NAME}".* 2>/dev/null
-            
-            NEED_COMPRESS=false
-            USE_SPLIT=false
-            FINAL_SPLIT_SIZE=$ACTUAL_SPLIT_SIZE
-            
-            # Check if user_max_size is set and higher than file size
-            if [ -n "$USER_MAX_SIZE" ] && [ "$USER_MAX_SIZE" -gt 0 ]; then
-              USER_LIMIT_BYTES=$((USER_MAX_SIZE * 1024 * 1024))
-              if [ "$SIZE" -le "$USER_LIMIT_BYTES" ]; then
-                # File is smaller than user's max size - create single part (no split)
-                USE_SPLIT=false
-                FINAL_SPLIT_SIZE=0
-                echo "File size ($(numfmt --to=iec $SIZE)) is within user limit (${USER_MAX_SIZE}MB) - creating single part"
-              else
-                # File is larger than user's max size - use split
-                USE_SPLIT=true
-                FINAL_SPLIT_SIZE=$ACTUAL_SPLIT_SIZE
-                echo "File size ($(numfmt --to=iec $SIZE)) exceeds user limit (${USER_MAX_SIZE}MB) - splitting into parts"
-              fi
+            if [ -z "$SPLIT_SIZE" ] || [ "$SPLIT_SIZE" -eq 0 ]; then
+              LIMIT=999999999
+              SPLIT_ARG=""
             else
-              # No user max size specified, use default behavior
-              if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt $((ACTUAL_SPLIT_SIZE * 1024 * 1024)) ]; then
-                NEED_COMPRESS=true
-                if [ "$SIZE" -gt $((ACTUAL_SPLIT_SIZE * 1024 * 1024)) ]; then
-                  USE_SPLIT=true
-                else
-                  USE_SPLIT=false
-                fi
-              fi
+              LIMIT=$((SPLIT_SIZE * 1024 * 1024))
+              SPLIT_ARG="-s ${SPLIT_SIZE}m"
             fi
             
-            # If upload is enabled, always compress (to single file)
-            if [ "$UPLOAD_ENABLED" = "true" ]; then
-              NEED_COMPRESS=true
-              USE_SPLIT=false
+            rm -f files_to_process.txt
+            
+            if [ ! -d "tmp_downloads" ]; then
+              echo "tmp_downloads directory not found"
+              exit 0
             fi
             
-            if [ "$NEED_COMPRESS" = "true" ] || [ -n "$HAS_PASS" ] || [ "$UPLOAD_ENABLED" = "true" ]; then
-              PASS_ARG=""
-              if [ -n "$HAS_PASS" ]; then
-                PASS_ARG="-P $HAS_PASS"
+            for FILE in tmp_downloads/*; do
+              if [ ! -f "$FILE" ]; then
+                continue
               fi
+              SIZE=$(stat -c%s "$FILE")
+              BASENAME=$(basename "$FILE")
+              SAFE_NAME=$(echo "$BASENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
               
-              if [ "$USE_SPLIT" = "true" ] && [ "$UPLOAD_ENABLED" != "true" ]; then
-                # Split into multiple parts
-                zip $PASS_ARG -s ${FINAL_SPLIT_SIZE}m "dl/${SAFE_NAME}.zip" -j "$FILE" > /dev/null 2>&1
+              rm -f "dl/${SAFE_NAME}".* 2>/dev/null
+              
+              # بررسی حجم فایل و مقدار تعیین شده توسط کاربر
+              USER_SPLIT_SIZE_MB="${{ github.event.inputs.split_size }}"
+              USER_SPLIT_SIZE_BYTES=$((USER_SPLIT_SIZE_MB * 1024 * 1024))
+              
+              # اگر عددی که کاربر داده بالاتر از حجم فایل بود، یک پارت فشرده (بدون اسپلیت) بساز
+              if [ -n "$USER_SPLIT_SIZE_MB" ] && [ "$USER_SPLIT_SIZE_MB" -gt 0 ] && [ "$SIZE" -lt "$USER_SPLIT_SIZE_BYTES" ]; then
+                echo "File size ($SIZE bytes) is less than user defined split size ($USER_SPLIT_SIZE_BYTES bytes). Creating single archive without split."
+                PASS_ARG=""
+                if [ -n "$HAS_PASS" ]; then
+                  PASS_ARG="-P $HAS_PASS"
+                fi
+                # بدون اسپلیت فشرده کن
+                zip $PASS_ARG "dl/${SAFE_NAME}.zip" -j "$FILE" > /dev/null 2>&1
+                echo "${SAFE_NAME}.zip" >> files_to_process.txt
+              elif [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$LIMIT" ]; then
+                PASS_ARG=""
+                if [ -n "$HAS_PASS" ]; then
+                  PASS_ARG="-P $HAS_PASS"
+                fi
+                zip $PASS_ARG $SPLIT_ARG "dl/${SAFE_NAME}.zip" -j "$FILE" > /dev/null 2>&1
+                
                 for ZPART in "dl/${SAFE_NAME}.zip" "dl/${SAFE_NAME}".z[0-9]*; do
                   if [ -f "$ZPART" ]; then
                     basename "$ZPART" >> files_to_process.txt
                   fi
                 done
               else
-                # Single zip file (no split)
-                zip $PASS_ARG "dl/${SAFE_NAME}.zip" -j "$FILE" > /dev/null 2>&1
-                if [ -f "dl/${SAFE_NAME}.zip" ]; then
-                  echo "${SAFE_NAME}.zip" >> files_to_process.txt
-                fi
+                cp -f "$FILE" "dl/$SAFE_NAME"
+                echo "$SAFE_NAME" >> files_to_process.txt
               fi
-            else
-              cp -f "$FILE" "dl/$SAFE_NAME"
-              echo "$SAFE_NAME" >> files_to_process.txt
-            fi
-          done
-          
-          rm -rf tmp_downloads
+            done
+            
+            rm -rf tmp_downloads
+          fi
 
-      - name: Upload Files to External Services
+      - name: Upload Files (Direct Upload Without Zip)
+        if: github.event.inputs.upload_to_uploadkon == 'true' || github.event.inputs.upload_to_rubika == 'true'
         shell: bash
         run: |
           UPLOAD_TO_UPLOADKON="${{ github.event.inputs.upload_to_uploadkon }}"
@@ -779,7 +754,6 @@ jobs:
           fi
 
       - name: Generate Links.md
-        if: steps.zip_manager.outputs.skip_github_push != 'true'
         shell: bash
         run: |
           if [ ! -s files_to_process.txt ] && [ ! -s new_files.txt ]; then
@@ -885,7 +859,6 @@ jobs:
           rm -f files_to_process.txt new_files.txt
 
       - name: Push to Repository
-        if: steps.zip_manager.outputs.skip_github_push != 'true'
         run: |
           BRANCH="${GITHUB_REF_NAME}"
           git config user.name "Downloader Bot"
@@ -894,11 +867,3 @@ jobs:
           git status
           git commit -m "Add downloaded files [skip ci]" || echo "No changes to commit"
           git push origin HEAD:$BRANCH || echo "Push failed"
-      
-      - name: Cleanup (Skip GitHub Push)
-        if: steps.zip_manager.outputs.skip_github_push == 'true'
-        run: |
-          echo "Upload to external service was enabled - files were not pushed to GitHub"
-          echo "Cleaning up local files..."
-          rm -rf dl/ 2>/dev/null || true
-          echo "Done"
